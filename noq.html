@@ -1,0 +1,315 @@
+<script>
+	// set up CORS proxy
+	let cors_api_host = 'http://cors-anywhere.herokuapp.com/';
+	/*(function() {
+	    var 
+	    var cors_api_url = 'https://' + cors_api_host + '/';
+	    var slice = [].slice;
+	    var origin = window.location.protocol + '//' + window.location.host;
+	    var open = XMLHttpRequest.prototype.open;
+	    XMLHttpRequest.prototype.open = function() {
+	        var args = slice.call(arguments);
+	        var targetOrigin = /^https?:\/\/([^\/]+)/i.exec(args[1]);
+	        if (targetOrigin && targetOrigin[0].toLowerCase() !== origin &&
+	            targetOrigin[1] !== cors_api_host)
+	            args[1] = cors_api_url + args[1];
+	        return open.apply(this, args);
+	    };
+	})();*/
+
+	class DatamuseResult
+	{
+		constructor(result)
+		{
+			this.word = result.word;
+			this.score = result.score;
+			this.tags = result.tags;
+		}
+
+		toString()
+		{
+			return `DatamuseResult(word: ${this.word}, score: ${this.score}, tags: ${this.tags})`;
+		}
+	}
+
+	class Character
+	{
+		constructor(string) { this.string = string; }
+		toString() { return this.string; }
+		matches(string) { return this.string == string; }
+	}
+
+	class Star
+	{
+		constructor() {}
+		toString() { return "*"; }
+		matches(string) { return true; }
+	}
+
+	class QuestionMark
+	{
+		constructor() {}
+		toString() { return "?"; }
+		matches(string) { return (string.length == 1); }
+	}
+
+	// TODO handle anagrams better
+	// currently Noq loses too much information
+	// and it can't handle simple anagrams like <ajzz>
+	// just because "jazz" isn't in the first 1000 results
+	// :( this might be the time to get some nutrimatic-y stuff
+	// into the mix! 3/27/2020
+	class CharacterAnagram
+	{
+		hash_string(string)
+		{
+			return string.split('').sort().join('');
+		}
+		constructor(string) { this.string = this.hash_string(string); }
+		toString() { return "?".repeat(this.string.length); }
+		matches(string) { return this.string == this.hash_string(string); }
+	}
+
+	class ComplexSpellingPattern
+	{
+		constructor(chunks) { this.chunks = chunks; }
+		toString() { return this.chunks.join(""); }
+		matches(string)
+		{
+			let paths = [0]; // string_index
+			for (let i=0; i<this.chunks.length; ++i)
+			{
+				if (paths.length == 0)
+					return false;
+				let new_paths = new Set();
+				for (let start of paths)
+					for (let end=start; end<=string.length; ++end)
+						if (this.chunks[i].matches(string.substring(start,end)))
+							new_paths.add(end);
+				paths = Array.from(new_paths);
+			}
+			return paths.includes(string.length);
+		}
+	}
+
+	class DatamuseQuery
+	{
+		static base_url = "https://api.datamuse.com/words?";
+
+		constructor(string)
+		{
+			this.raw_string = string;
+			[this.attributes, this.spelling_pattern] = parse_query(string);
+			this.flattened_results = this.query_flattened();
+			this.flattened_words = new Set();
+			for (let result of this.flattened_results)
+				this.flattened_words.add(result.word);
+		}
+
+		toString()
+		{
+			return this.spelling_pattern.toString();
+		}
+
+		matches(string)
+		{
+			return this.flattened_words.has(string) &&
+				this.spelling_pattern.matches(string);
+		}
+
+		get_url(max_results=1000)
+		{
+			let url = DatamuseQuery.base_url;
+			for (const [key,val] of Object.entries(this.attributes))
+			{
+				let string = val;
+				url += `${key}=${encodeURI(string)}&`;
+			}
+			url += `sp=${this}&max=${max_results}`;
+			return url;
+		}
+
+		/* Queries without evaluating subqueries using flattened spelling pattern */
+		query_flattened()
+		{
+			// query Datamuse
+			let url = this.get_url();
+			let html = query_site(url);
+			let results_json = JSON.parse(html);
+
+			let results_arr = [];
+			for (let result of results_json)
+				results_arr.push(new DatamuseResult(result));
+			return results_arr;
+		}
+
+		query()
+		{
+			let results = [];
+			for (let result of this.flattened_results)
+				if (this.matches(result.word))
+					results.push(result);
+			return results;
+		}
+	}
+
+	const attribute_map = {":": "ml", "%": "sl", "L":"lc", "R":"rc"};
+	const delimiters = {"<":[">",CharacterAnagram], "{":["}",DatamuseQuery]};
+	let default_mode = "sp";
+
+	function query_site(address, need_cors_proxy=false)
+	{
+		var xhttp = new XMLHttpRequest();
+
+		let return_value = null;
+		xhttp.onreadystatechange = function()
+		{
+	    	if (this.readyState == 4 && this.status == 200)
+	    		return_value = this.responseText;
+	  	};
+		/*
+			NB: synchronous XMLHttpRequests are apparently deprecated, sad :( not super sure how to fix though. let's hope it doesn't get actually killed off anytime soon.
+		*/
+		if (need_cors_proxy)
+			address = cors_api_host + address;
+		xhttp.open("GET", address, false);
+		xhttp.send();
+		return return_value;
+	}
+
+	/* Helper function for tokenizing input. */
+	function find_closing_delimiter(string, start, start_char, end_char)
+	{
+		let diff = 0;
+		for (let i=start; i<string.length; ++i)
+		{
+			let ch = string.charAt(i);
+			if (ch == start_char) diff++;
+			if (ch == end_char) diff--;
+			if (diff == 0)
+				return i;
+		}
+		return -1;
+	}
+
+	function parse_query(string)
+	{
+		let attributes = {};
+		let mode = "sp";
+		let forming_spelling_pattern = true;
+		let chunk = "";
+		let spelling_pattern = [];
+
+		let i = 0;
+		while (i < string.length)
+		{
+			let ch = string.charAt(i);
+
+			for (let [s_ch,s_mode] of Object.entries(attribute_map))
+				if (ch == s_ch)
+				{
+					if (!forming_spelling_pattern)
+					{
+						// push chunk onto current mode
+						if (!attributes[mode])
+							attributes[mode] = "";
+						attributes[mode] += chunk;
+						chunk = "";
+					}
+
+					// start new mode
+					mode = s_mode;
+					attributes[mode] = "";
+					forming_spelling_pattern = false;
+					break;
+				}
+
+			if (forming_spelling_pattern)
+			{
+				if (ch == "*")
+					spelling_pattern.push(new Star());
+				else if (ch == "?")
+					spelling_pattern.push(new QuestionMark());
+				else if (ch.match(/[a-z]/i))
+					spelling_pattern.push(new Character(ch));
+				else // complex element (DatamuseQuery, or CharacterAnagram (TODO))
+					for (let [start_char, data] of Object.entries(delimiters))
+						if (ch == start_char)
+						{
+							let [end_char, pattern_class] = data;
+							let end = find_closing_delimiter(string, i, start_char, end_char);
+							let subpattern = new pattern_class(string.substring(i+1,end));
+							spelling_pattern.push(subpattern);
+							i = end;
+						}
+			}
+				
+			else if (!attribute_map[ch])
+				chunk += ch;
+			i++;
+		}
+
+		if (!forming_spelling_pattern)
+		{
+			// push chunk onto current mode
+			if (!attributes[mode])
+				attributes[mode] = "";
+			attributes[mode] += chunk;
+			chunk = "";
+		}
+
+		if (spelling_pattern.length == 0)
+			spelling_pattern = [new Star()];
+
+		return [attributes, new ComplexSpellingPattern(spelling_pattern)];
+	}
+
+	function send_query()
+	{
+		let query_contents = document.getElementById("input_textbox").value.trim();
+		if (query_contents.length > 0)
+		{
+			let query_results = new DatamuseQuery(query_contents).query();
+			let pretty_query_results = prettify_results(query_results);
+			document.getElementById("output").innerHTML = pretty_query_results;
+		}
+	}
+
+	function prettify_results(query_results)
+	{
+		let arr = [];
+		arr.push('<br>');
+		for (let i=0; i<query_results.length; ++i)
+		{
+			let result = query_results[i];
+			arr.push(`<div class='result'>${i+1}. ${result.word}</div>`);
+		}
+		return arr.join('\n');
+	}
+
+	document.addEventListener('keyup',
+		function(e)
+		{
+			let input_textbox = document.getElementById("input_textbox");
+			if (e.key == 'Enter' && document.activeElement == input_textbox)
+				send_query();
+		}
+	);
+</script>
+
+<head>
+<title>Noq</title>
+</head>
+<html>
+
+<div id="input">
+	<input id="input_textbox">
+	</input>
+
+	<button onclick="send_query()">Query</button>
+</div>
+	
+<div id="output">
+
+</div>
+</html>
